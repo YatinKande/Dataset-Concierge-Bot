@@ -1,0 +1,25 @@
+import json
+
+def lambda_handler(event, context):
+    try:
+        print("Incoming event:", json.dumps(event))
+        # Directly read message if not wrapped
+        user_message = event["messages"][0]["unstructured"]["text"]
+    except Exception:
+        try:
+            # Fallback: parse if wrapped in body
+            body = json.loads(event.get("body", "{}"))
+            user_message = body["messages"][0]["unstructured"]["text"]
+        except Exception:
+            user_message = "unknown"
+
+    reply_text = f"You said: {user_message}"
+
+    return {
+        "statusCode": 200,
+        "headers": {
+            "Access-Control-Allow-Origin": "*",
+            "Content-Type": "application/json"
+        },
+        "body": json.dumps({"response": reply_text})
+    }

@@ -1,0 +1,198 @@
+import json
+import os
+import boto3
+import requests
+from datetime import datetime
+from boto3.dynamodb.conditions import Key, Attr
+
+# Load environment variables
+HF_TOKEN = os.environ['HF_TOKEN']
+SNS_TOPIC_ARN = os.environ['SNS_TOPIC_ARN']
+SQS_QUEUE_URL = os.environ['SQS_QUEUE_URL']
+KAGGLE_USERNAME = os.environ.get('KAGGLE_USERNAME')      # <-- New
+KAGGLE_KEY = os.environ.get('KAGGLE_KEY')                # <-- New
+
+# Initialize AWS services
+sns = boto3.client('sns')
+sqs = boto3.client('sqs')
+dynamodb = boto3.resource('dynamodb')
+DYNAMODB_TABLE = 'ChatbotData'
+
+def lambda_handler(event, context):
+    # --- 1. User existence check for onboarding logic ---
+    if event.get("checkUser") and event.get("userID"):
+        userID = event["userID"]
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        try:
+            try:
+                resp = table.query(KeyConditionExpression=Key('userID').eq(userID))
+            except Exception as qerr:
+                resp = table.scan(FilterExpression=Attr("userID").eq(userID))
+            exists = False
+            if resp.get("Items"):
+                exists = True
+            return {"exists": exists}
+        except Exception as e:
+            print(f"User Check Error: {e}")
+            return {"exists": False}
+
+    # --- 2. Fetch History for Existing User ---
+    if event.get("history") and event.get("userID"):
+        userID = event["userID"]
+        table = dynamodb.Table(DYNAMODB_TABLE)
+        try:
+            resp = table.scan(FilterExpression=Attr("userID").eq(userID))
+            history = []
+            if resp.get('Items'):
+                for item in resp['Items']:
+                    history.append({
+                        'timestamp': item.get('timestamp'),
+                        'datasets': item.get('datasets', [])
+                    })
+            return {'history': history}
+        except Exception as e:
+            print(f"History Fetch Error: {str(e)}")
+            return {'history': []}
+
+    # --- 3. Normal dataset search workflow, with Kaggle support ---
+    try:
+        slots = event['sessionState']['intent']['slots']
+        userID = slots['userID']['value']['interpretedValue']
+        topic = slots['topic']['value']['interpretedValue']
+        source = slots['source']['value']['interpretedValue']
+        format_type = slots['format']['value']['interpretedValue']
+        date = slots['date']['value']['interpretedValue']
+        name = slots['name']['value']['interpretedValue']
+        email = slots['email']['value']['interpretedValue']
+
+        # ------ KAGGLE BRANCH -------
+        if source and source.lower() == "kaggle":
+            datasets = search_kaggle_datasets(topic, format_type)
+        else:
+            datasets = search_huggingface_datasets(topic, format_type, date)
+
+        if not datasets:
+            response_message = f"Sorry, I couldn't find any datasets for topic '{topic}'. Please try a different topic."
+            return {'messages': [{'content': response_message}]}
+        else:
+            store_request_in_dynamodb(userID, topic, source, format_type, date, name, email, datasets)
+            send_to_sqs(userID, topic, source, format_type, date, name, email, datasets)
+            send_email_notification(name, email, topic, datasets)
+            return {
+                'messages': [{'content': f"Found {len(datasets)} dataset(s) for '{topic}'. See links below."}],
+                'datasets': datasets
+            }
+    except Exception as e:
+        print(f"Error: {str(e)}")
+        return {'messages': [{'content': "Sorry, I encountered an error while processing your request. Please try again."}]}
+
+def search_kaggle_datasets(topic, format_type):
+    # ---- NEW helper for Kaggle ----
+    try:
+        url = f"https://www.kaggle.com/api/v1/datasets/list?search={topic}"
+        if format_type and format_type.lower() != "any":
+            url += f"&filetype={format_type}"
+        auth = requests.auth._basic_auth_str(KAGGLE_USERNAME, KAGGLE_KEY)
+        response = requests.get(url, headers={"Authorization": auth}, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        datasets = []
+        for ds in data[:10]:
+            datasets.append({
+                'name': ds.get('title', ds.get('ref', 'Unknown')),
+                'url': f"https://www.kaggle.com/datasets/{ds.get('ref','')}",
+                'downloads': ds.get('downloadCount', 0),
+                'description': ds.get('subtitle', '')[:200] # Kaggle API may use 'subtitle'
+            })
+        return datasets
+    except Exception as e:
+        print(f"Error searching Kaggle: {str(e)}")
+        return []
+
+def search_huggingface_datasets(topic, format_type, date):
+    base_url = "https://huggingface.co/api/datasets"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    params = {
+        'search': topic,
+        'sort': 'downloads',
+        'direction': -1,
+        'limit': 20,
+    }
+    try:
+        response = requests.get(base_url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        datasets = []
+        for ds in data:
+            ds_formats = ds.get('cardData', {}).get('format', [])
+            if format_type.lower() == "any" or \
+               (isinstance(ds_formats, list) and format_type.lower() in [f.lower() for f in ds_formats]):
+                if not date or date.lower() == "any":
+                    if len(datasets) < 10:
+                        datasets.append({
+                            'name': ds.get('id', 'Unknown'),
+                            'url': f"https://huggingface.co/datasets/{ds.get('id','')}",
+                            'downloads': ds.get('downloads', 0),
+                            'description': ds.get('description', '')[:200]
+                        })
+                else:
+                    datasets.append({
+                        'name': ds.get('id', 'Unknown'),
+                        'url': f"https://huggingface.co/datasets/{ds.get('id','')}",
+                        'downloads': ds.get('downloads', 0),
+                        'description': ds.get('description', '')[:200]
+                    })
+        return datasets[:10]
+    except Exception as e:
+        print(f"Error searching HuggingFace: {str(e)}")
+        return []
+
+def store_request_in_dynamodb(userID, topic, source, format_type, date, name, email, datasets):
+    table = dynamodb.Table(DYNAMODB_TABLE)
+    item = {
+        'RequestID': f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{email.replace('@', '_at_')}",
+        'userID': userID,
+        'timestamp': datetime.now().isoformat(),
+        'name': name,
+        'email': email,
+        'topic': topic,
+        'source': source,
+        'format': format_type,
+        'date': date,
+        'datasets_found': len(datasets),
+        'datasets': datasets
+    }
+    table.put_item(Item=item)
+
+def send_to_sqs(userID, topic, source, format_type, date, name, email, datasets):
+    message = {
+        'type': 'dataset_request',
+        'timestamp': datetime.now().isoformat(),
+        'user': {'userID': userID, 'name': name, 'email': email},
+        'request': {
+            'topic': topic,
+            'source': source,
+            'format': format_type,
+            'date': date
+        },
+        'results': {'count': len(datasets), 'datasets': datasets}
+    }
+    sqs.send_message(QueueUrl=SQS_QUEUE_URL, MessageBody=json.dumps(message))
+
+def send_email_notification(name, email, topic, datasets):
+    subject = f"{len(datasets)} Dataset(s) Found: {topic}"
+    dataset_list = ""
+    for i, ds in enumerate(datasets, 1):
+        dataset_list += f"{i}. {ds['name']}\n   URL: {ds['url']}\n   Downloads: {ds['downloads']:,}\n   Description: {ds['description']}\n\n"
+    message = f"""Hello {name},\n\nHere are the dataset(s) found for your request on '{topic}':\n\n{dataset_list}\nThank you for using the Chatbot Concierge!\n\nBest regards,\nYour Personal Dataset Assistant"""
+    sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=subject,
+        Message=message,
+        MessageAttributes={
+            'email': {
+                'DataType': 'String',
+                'StringValue': email
+            }
+        }
+    )
